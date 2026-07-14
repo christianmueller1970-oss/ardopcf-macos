@@ -46,15 +46,14 @@ kill -0 $PID_A 2>/dev/null || { cat "$LOG_A"; fail "instance A died"; }
 kill -0 $PID_B 2>/dev/null || { cat "$LOG_B"; fail "instance B died"; }
 
 echo "Configuring B (listener) ..."
-python3 host/python/diagnostichost.py -n -p 8517 -s \
-	"!MYCALL HB9HJI-2" "!LISTEN TRUE" >"$HOST_B" 2>&1 &
+python3 scripts/loopback_host.py 8517 \
+	"MYCALL HB9HJI-2" "ARQBW 500MAX" "LISTEN TRUE" >"$HOST_B" 2>&1 &
 HOSTB_PID=$!
 sleep 2
 
-echo "A calls B via ARQCALL and sends test data ..."
-python3 host/python/diagnostichost.py -n -p 8515 -s \
-	"!MYCALL HB9HJI-1" "!ARQBW 500MAX" "!ARQCALL HB9HJI-2 5" \
-	>"$HOST_A" 2>&1 &
+echo "A calls B via ARQCALL ..."
+python3 scripts/loopback_host.py 8515 \
+	"MYCALL HB9HJI-1" "ARQBW 500MAX" "ARQCALL HB9HJI-2 5" >"$HOST_A" 2>&1 &
 HOSTA_PID=$!
 
 echo "Waiting up to $TIMEOUT s for the ARQ connection ..."
@@ -74,8 +73,8 @@ sleep 1
 pkill -9 ardopcf 2>/dev/null
 
 echo
-echo "=== host A (caller) ==="; grep "CMD  <<" "$HOST_A" | tail -12
-echo "=== host B (listener) ==="; grep "CMD  <<" "$HOST_B" | tail -12
+echo "=== host A (caller) ==="; tail -14 "$HOST_A"
+echo "=== host B (listener) ==="; tail -14 "$HOST_B"
 echo
 
 if [ -n "$CONNECTED" ]; then
