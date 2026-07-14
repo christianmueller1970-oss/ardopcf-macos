@@ -19,6 +19,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <ctype.h>
+#include <errno.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/ioctl.h>
@@ -1419,8 +1420,55 @@ void SoundFlush()
 	return;
 }
 
+// PTT via a Hamlib rigctld network connection ("-p <ip>:<port>").
+// Upstream declares PTTHAMLIB but never acts on it; this makes it work
+// by sending rigctld's set_ptt command over TCP.
+
+static int hamlibSock = -1;
+
+static void HamlibPTT(int PTTState)
+{
+	char cmd[8];
+	int len;
+
+	if (hamlibSock == -1)
+	{
+		hamlibSock = socket(AF_INET, SOCK_STREAM, 0);
+		if (hamlibSock == -1)
+			return;
+
+		if (connect(hamlibSock, &HamlibAddr, sizeof(struct sockaddr_in)) == -1)
+		{
+			ZF_LOGE("Failed to connect to Hamlib rigctld for PTT, errno=%d", errno);
+			close(hamlibSock);
+			hamlibSock = -1;
+			return;
+		}
+	}
+
+	len = snprintf(cmd, sizeof(cmd), "T %d\n", PTTState ? 1 : 0);
+
+	if (send(hamlibSock, cmd, len, 0) != len)
+	{
+		ZF_LOGE("Hamlib PTT send failed, errno=%d, will reconnect", errno);
+		close(hamlibSock);
+		hamlibSock = -1;
+		return;
+	}
+
+	// rigctld replies "RPRT 0\n"; drain without blocking so the
+	// socket buffer does not fill up over a long session.
+	{
+		char reply[64];
+		recv(hamlibSock, reply, sizeof(reply), MSG_DONTWAIT);
+	}
+}
+
 VOID RadioPTT(int PTTState)
 {
+	if (PTTMode & PTTHAMLIB)
+		HamlibPTT(PTTState);
+
 	if (PTTMode & PTTRTS)
 		if (PTTState)
 			COMSetRTS(hPTTDevice);

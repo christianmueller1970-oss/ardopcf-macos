@@ -68,3 +68,5 @@ newArdopSampleArrays.c
 
 # Editor garbage
 /.vscode/**
+deps/
+dist/
