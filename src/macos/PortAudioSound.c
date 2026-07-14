@@ -18,12 +18,15 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+
+#include <portaudio.h>
 
 #define HANDLE int
 
@@ -90,8 +93,8 @@ short inbuffer[2][1200];  // Two Transfer/DMA buffers of 0.1 Sec
 
 BOOL Loopback = FALSE;
 
-char CaptureDevice[80] = "0";
-char PlaybackDevice[80] = "0";
+char CaptureDevice[80] = "DEFAULT";
+char PlaybackDevice[80] = "DEFAULT";
 
 char * CaptureDevices = CaptureDevice;
 char * PlaybackDevices = CaptureDevice;
@@ -490,10 +493,20 @@ void txSleep(int mS)
 
 // PortAudio Code
 //
-// M1 milestone: the audio backend is not yet implemented.  All audio
-// functions are stubs that fail cleanly, so that the WAV decode path
-// (-d) and the NOSOUND pseudo device work.  The real PortAudio
-// implementation lands with the M2 milestone.
+// The blocking PortAudio API maps directly onto the poll/blocking
+// semantics the platform layer inherited from ALSA: SoundCardRead
+// checks Pa_GetStreamReadAvailable before reading, SoundCardWrite
+// waits for buffer space while running the background polls.
+// All macOS devices are opened at 12000 Hz; paMacCore resamples
+// to/from the device's native rate internally.
+//
+// Like the ALSA backend (SHARECAPTURE), only one direction is open at
+// a time: the playback stream is opened when TX starts (StopCapture)
+// and closed again at the end of TX (SoundFlush), which reopens the
+// capture stream.
+
+static PaStream * playStream = NULL;
+static PaStream * recStream = NULL;
 
 int m_playchannels = 1;
 int m_recchannels = 1;
@@ -512,10 +525,120 @@ int WriteDeviceCount = 0;
 char ** ReadDevices = NULL;
 int ReadDeviceCount = 0;
 
-// Dummy stream state until the PortAudio backend is implemented;
-// non-NULL means "open" to the code paths shared with the other platforms.
-static int playstreamopen = 0;
-static int recstreamopen = 0;
+static BOOL PaInitialized = FALSE;
+
+static BOOL EnsurePaInitialized()
+{
+	PaError err;
+
+	if (PaInitialized)
+		return TRUE;
+
+	err = Pa_Initialize();
+	if (err != paNoError)
+	{
+		ZF_LOGE("Pa_Initialize failed: %s", Pa_GetErrorText(err));
+		return FALSE;
+	}
+	PaInitialized = TRUE;
+	return TRUE;
+}
+
+// Resolve a device argument to a PortAudio device index.  Accepted forms,
+// tried in this order:
+//   "DEFAULT"           the system default input/output device
+//   a decimal number    PortAudio device index (as shown by the listing)
+//   otherwise           exact device name, then unique case-insensitive
+//                       substring of a device name
+// Unlike the ALSA backend, the argument is never cut at the first space:
+// CoreAudio device names regularly contain spaces ("USB Audio CODEC").
+static PaDeviceIndex FindDevice(const char * spec, BOOL wantInput, char * ErrorMsg)
+{
+	int i;
+	int count = Pa_GetDeviceCount();
+	PaDeviceIndex match = paNoDevice;
+	int matches = 0;
+	BOOL allDigits = TRUE;
+
+	if (stricmp((const unsigned char *)spec, (const unsigned char *)"DEFAULT") == 0)
+	{
+		PaDeviceIndex dev = wantInput ? Pa_GetDefaultInputDevice() : Pa_GetDefaultOutputDevice();
+		if (dev == paNoDevice && ErrorMsg)
+			sprintf(ErrorMsg, "no default %s device", wantInput ? "capture" : "playback");
+		return dev;
+	}
+
+	for (i = 0; spec[i]; i++)
+	{
+		if (!isdigit((unsigned char)spec[i]))
+		{
+			allDigits = FALSE;
+			break;
+		}
+	}
+
+	if (allDigits && spec[0])
+	{
+		int idx = atoi(spec);
+		if (idx >= 0 && idx < count)
+			return (PaDeviceIndex)idx;
+		if (ErrorMsg)
+			sprintf(ErrorMsg, "audio device index %d out of range (0..%d)", idx, count - 1);
+		return paNoDevice;
+	}
+
+	// Exact name match
+
+	for (i = 0; i < count; i++)
+	{
+		const PaDeviceInfo * di = Pa_GetDeviceInfo(i);
+		int channels = wantInput ? di->maxInputChannels : di->maxOutputChannels;
+
+		if (channels > 0 && strcmp(di->name, spec) == 0)
+			return (PaDeviceIndex)i;
+	}
+
+	// Unique case-insensitive substring match
+
+	for (i = 0; i < count; i++)
+	{
+		const PaDeviceInfo * di = Pa_GetDeviceInfo(i);
+		int channels = wantInput ? di->maxInputChannels : di->maxOutputChannels;
+		size_t namelen = strlen(di->name);
+		size_t speclen = strlen(spec);
+		size_t off;
+
+		if (channels <= 0 || speclen > namelen)
+			continue;
+
+		for (off = 0; off + speclen <= namelen; off++)
+		{
+			if (strncasecmp(di->name + off, spec, speclen) == 0)
+			{
+				if (match != (PaDeviceIndex)i)
+				{
+					match = (PaDeviceIndex)i;
+					matches++;
+				}
+				break;
+			}
+		}
+	}
+
+	if (matches == 1)
+		return match;
+
+	if (ErrorMsg)
+	{
+		if (matches == 0)
+			sprintf(ErrorMsg, "no %s device matches \"%s\"",
+				wantInput ? "capture" : "playback", spec);
+		else
+			sprintf(ErrorMsg, "\"%s\" matches %d %s devices, be more specific",
+				spec, matches, wantInput ? "capture" : "playback");
+	}
+	return paNoDevice;
+}
 
 int CheckifLoaded()
 {
@@ -529,12 +652,49 @@ int CheckifLoaded()
 	return TRUE;
 }
 
+// Build a device list entry of the form "<index>: <name>" and log the
+// device's capabilities the same way the ALSA backend does.
+static char ** AddDeviceToList(char ** list, int * count, int index, const PaDeviceInfo * di)
+{
+	char NameString[300];
+
+	snprintf(NameString, sizeof(NameString), "%d: %s", index, di->name);
+
+	list = realloc(list, (*count + 1) * sizeof(char *));
+	list[(*count)++] = strdup(NameString);
+	return list;
+}
+
 int GetOutputDeviceCollection()
 {
+	int i, count;
+
 	ZF_LOGI("Playback Devices\n");
-	ZF_LOGE("PortAudio backend not yet implemented on macOS (M1 stub)");
+
+	if (!EnsurePaInitialized())
+		return 0;
+
+	while (WriteDeviceCount)
+		free(WriteDevices[--WriteDeviceCount]);
+	free(WriteDevices);
 	WriteDevices = NULL;
-	WriteDeviceCount = 0;
+
+	count = Pa_GetDeviceCount();
+
+	for (i = 0; i < count; i++)
+	{
+		const PaDeviceInfo * di = Pa_GetDeviceInfo(i);
+
+		if (di->maxOutputChannels <= 0)
+			continue;
+
+		ZF_LOGI("  Device %d: `%s', %d channels, native rate %.0f Hz%s",
+			i, di->name, di->maxOutputChannels, di->defaultSampleRate,
+			i == Pa_GetDefaultOutputDevice() ? " (default)" : "");
+
+		WriteDevices = AddDeviceToList(WriteDevices, &WriteDeviceCount, i, di);
+	}
+
 	return WriteDeviceCount;
 }
 
@@ -550,10 +710,34 @@ int GetNextOutputDevice(char * dest, int max, int n)
 
 int GetInputDeviceCollection()
 {
+	int i, count;
+
 	ZF_LOGI("Capture Devices\n");
-	ZF_LOGE("PortAudio backend not yet implemented on macOS (M1 stub)");
+
+	if (!EnsurePaInitialized())
+		return 0;
+
+	while (ReadDeviceCount)
+		free(ReadDevices[--ReadDeviceCount]);
+	free(ReadDevices);
 	ReadDevices = NULL;
-	ReadDeviceCount = 0;
+
+	count = Pa_GetDeviceCount();
+
+	for (i = 0; i < count; i++)
+	{
+		const PaDeviceInfo * di = Pa_GetDeviceInfo(i);
+
+		if (di->maxInputChannels <= 0)
+			continue;
+
+		ZF_LOGI("  Device %d: `%s', %d channels, native rate %.0f Hz%s",
+			i, di->name, di->maxInputChannels, di->defaultSampleRate,
+			i == Pa_GetDefaultInputDevice() ? " (default)" : "");
+
+		ReadDevices = AddDeviceToList(ReadDevices, &ReadDeviceCount, i, di);
+	}
+
 	return ReadDeviceCount;
 }
 
@@ -568,20 +752,157 @@ int GetNextInputDevice(char * dest, int max, int n)
 
 int OpenSoundPlayback(char * PlaybackDevice, int m_sampleRate, int channels, char * ErrorMsg)
 {
-	if (ErrorMsg)
-		sprintf (ErrorMsg, "PortAudio backend not yet implemented on macOS (M1 stub)");
-	else
-		ZF_LOGE("PortAudio backend not yet implemented on macOS (M1 stub)");
-	return false;
+	PaDeviceIndex dev;
+	const PaDeviceInfo * di;
+	PaStreamParameters params;
+	PaError err;
+
+	if (!EnsurePaInitialized())
+		return false;
+
+	if (playStream)
+	{
+		Pa_CloseStream(playStream);
+		playStream = NULL;
+	}
+
+	dev = FindDevice(PlaybackDevice, FALSE, ErrorMsg);
+	if (dev == paNoDevice)
+	{
+		if (!ErrorMsg)
+			ZF_LOGE("cannot find playback audio device %s", PlaybackDevice);
+		return false;
+	}
+
+	di = Pa_GetDeviceInfo(dev);
+
+	memset(&params, 0, sizeof(params));
+	params.device = dev;
+	params.channelCount = channels;
+	params.sampleFormat = paInt16;
+	params.suggestedLatency = di->defaultHighOutputLatency;
+
+	err = Pa_OpenStream(&playStream, NULL, &params, m_sampleRate,
+		paFramesPerBufferUnspecified, paNoFlag, NULL, NULL);
+
+	if (err != paNoError && channels == 1)
+	{
+		// Some devices refuse mono; retry in stereo like the ALSA backend
+		channels = 2;
+		params.channelCount = 2;
+		err = Pa_OpenStream(&playStream, NULL, &params, m_sampleRate,
+			paFramesPerBufferUnspecified, paNoFlag, NULL, NULL);
+	}
+
+	if (err != paNoError)
+	{
+		playStream = NULL;
+		if (ErrorMsg)
+			sprintf(ErrorMsg, "cannot open playback audio device %s (%s)",
+				PlaybackDevice, Pa_GetErrorText(err));
+		else
+			ZF_LOGE("cannot open playback audio device %s (%s)",
+				PlaybackDevice, Pa_GetErrorText(err));
+		return false;
+	}
+
+	err = Pa_StartStream(playStream);
+	if (err != paNoError)
+	{
+		Pa_CloseStream(playStream);
+		playStream = NULL;
+		if (ErrorMsg)
+			sprintf(ErrorMsg, "cannot start playback stream (%s)", Pa_GetErrorText(err));
+		else
+			ZF_LOGE("cannot start playback stream (%s)", Pa_GetErrorText(err));
+		return false;
+	}
+
+	Savedplaychannels = m_playchannels = channels;
+
+	// The ring buffer of a freshly started blocking stream reports 0
+	// writable frames until the CoreAudio callback has run, so the real
+	// buffer size (used by the SoundFlush drain check) is tracked as
+	// the largest value seen while writing.
+	MaxAvail = Pa_GetStreamWriteAvailable(playStream);
+
+	return true;
 }
 
 int OpenSoundCapture(char * CaptureDevice, int m_sampleRate, char * ErrorMsg)
 {
-	if (ErrorMsg)
-		sprintf (ErrorMsg, "PortAudio backend not yet implemented on macOS (M1 stub)");
-	else
-		ZF_LOGE("PortAudio backend not yet implemented on macOS (M1 stub)");
-	return false;
+	PaDeviceIndex dev;
+	const PaDeviceInfo * di;
+	PaStreamParameters params;
+	PaError err;
+
+	if (!EnsurePaInitialized())
+		return false;
+
+	if (recStream)
+	{
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+	}
+
+	dev = FindDevice(CaptureDevice, TRUE, ErrorMsg);
+	if (dev == paNoDevice)
+	{
+		if (!ErrorMsg)
+			ZF_LOGE("cannot find capture audio device %s", CaptureDevice);
+		return false;
+	}
+
+	di = Pa_GetDeviceInfo(dev);
+
+	m_recchannels = 1;
+
+	if (UseLeftRX == 0 || UseRightRX == 0)
+		m_recchannels = 2;  // L/R implies stereo
+
+	memset(&params, 0, sizeof(params));
+	params.device = dev;
+	params.channelCount = m_recchannels;
+	params.sampleFormat = paInt16;
+	params.suggestedLatency = di->defaultHighInputLatency;
+
+	err = Pa_OpenStream(&recStream, &params, NULL, m_sampleRate,
+		paFramesPerBufferUnspecified, paNoFlag, NULL, NULL);
+
+	if (err != paNoError && m_recchannels == 1)
+	{
+		// Some devices refuse mono; retry in stereo like the ALSA backend
+		m_recchannels = 2;
+		params.channelCount = 2;
+		err = Pa_OpenStream(&recStream, &params, NULL, m_sampleRate,
+			paFramesPerBufferUnspecified, paNoFlag, NULL, NULL);
+	}
+
+	if (err != paNoError)
+	{
+		recStream = NULL;
+		if (ErrorMsg)
+			sprintf(ErrorMsg, "cannot open capture audio device %s (%s)",
+				CaptureDevice, Pa_GetErrorText(err));
+		else
+			ZF_LOGE("cannot open capture audio device %s (%s)",
+				CaptureDevice, Pa_GetErrorText(err));
+		return false;
+	}
+
+	err = Pa_StartStream(recStream);  // without this avail stays at 0
+	if (err != paNoError)
+	{
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+		if (ErrorMsg)
+			sprintf(ErrorMsg, "cannot start capture stream (%s)", Pa_GetErrorText(err));
+		else
+			ZF_LOGE("cannot start capture stream (%s)", Pa_GetErrorText(err));
+		return FALSE;
+	}
+
+	return TRUE;
 }
 
 int OpenSoundCard(char * CaptureDevice, char * PlaybackDevice, int c_sampleRate, int p_sampleRate, char * ErrorMsg)
@@ -621,6 +942,15 @@ int OpenSoundCard(char * CaptureDevice, char * PlaybackDevice, int c_sampleRate,
 	SavedPlaybackRate = p_sampleRate;
 	if (OpenSoundPlayback(PlaybackDevice, p_sampleRate, Channels, ErrorMsg))
 	{
+		// Close playback again until TX starts (see SHARECAPTURE in the
+		// ALSA backend); StopCapture() reopens it before transmitting.
+
+		if (playStream)
+		{
+			Pa_CloseStream(playStream);
+			playStream = NULL;
+		}
+
 		ZF_LOGI("Opening Capture Device %s Rate %d", CaptureDevice, c_sampleRate);
 
 		strcpy(SavedCaptureDevice, CaptureDevice);  // Saved so we can reopen in error recovery
@@ -635,30 +965,189 @@ int OpenSoundCard(char * CaptureDevice, char * PlaybackDevice, int c_sampleRate,
 
 int CloseSoundCard()
 {
-	recstreamopen = 0;
-	playstreamopen = 0;
+	if (recStream)
+	{
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+	}
+
+	if (playStream)
+	{
+		Pa_CloseStream(playStream);
+		playStream = NULL;
+	}
 	return 0;
 }
 
 
 int SoundCardWrite(short * input, unsigned int nSamples)
 {
-	if (!playstreamopen)
+	if (playStream == NULL)
 		return 0;
+
+	// Stop Capture (as with SHARECAPTURE in the ALSA backend: only one
+	// direction is open while transmitting)
+
+	if (recStream)
+	{
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+	}
 
 	return PackSamplesAndSend(input, nSamples);
 }
 
 int PackSamplesAndSend(short * input, int nSamples)
 {
-	// M1 stub: pretend the samples were sent.
+	short samples[256000];
+	short * sampptr = samples;
+	int n;
+	int written = 0;
+	PaError err;
+
+	if (playStream == NULL)
+		return 0;
+
+	// Expand the mono samples to the stream's channel count.
+	// (The ALSA backend tests UseLeftRX here; that looks like an
+	// upstream typo - the TX flags are used on macOS instead.  With the
+	// default of all flags TRUE the behaviour is identical.)
+
+	if (m_playchannels == 1)
+	{
+		memcpy(samples, input, nSamples * sizeof(short));
+	}
+	else
+	{
+		for (n = 0; n < nSamples; n++)
+		{
+			if (UseLeftTX)
+				*(sampptr++) = input[0];
+			else
+				*(sampptr++) = 0;
+
+			if (UseRightTX)
+				*(sampptr++) = input[0];
+			else
+				*(sampptr++) = 0;
+
+			input ++;
+		}
+	}
+
+	// PortAudio's blocking-mode ring buffer may be smaller than a
+	// 0.1 s transfer buffer, so feed it in chunks as space becomes
+	// available, running the background polls (host TCP, webgui)
+	// in between.  A full ring is normal during TX - the modulator
+	// produces samples faster than real time.
+
+	while (written < nSamples)
+	{
+		long avail = Pa_GetStreamWriteAvailable(playStream);
+		int chunk;
+
+		if (avail < 0)
+		{
+			ZF_LOGE("Pa_GetStreamWriteAvailable error: %s",
+				Pa_GetErrorText((PaError)avail));
+			return written;
+		}
+
+		if (avail > MaxAvail)
+			MaxAvail = avail;
+
+		if (avail == 0)
+		{
+			txSleep(10);
+			if (playStream == NULL)  // closed while waiting
+				return written;
+			continue;
+		}
+
+		chunk = (int)avail;
+		if (chunk > nSamples - written)
+			chunk = nSamples - written;
+
+		err = Pa_WriteStream(playStream, samples + (long)written * m_playchannels, chunk);
+
+		// An output underflow is possible after a buffer gap and is not
+		// fatal; the samples have still been queued.
+
+		if (err != paNoError && err != paOutputUnderflowed)
+		{
+			ZF_LOGE("Pa_WriteStream error: %s", Pa_GetErrorText(err));
+			return written;
+		}
+
+		written += chunk;
+	}
+
 	return nSamples;
 }
 
 int SoundCardRead(short * input, unsigned int nSamples)
 {
-	// M1 stub: no samples available.
-	return 0;
+	short samples[65536];
+	int n;
+	int start;
+	long avail;
+	PaError err;
+
+	if (recStream == NULL)
+		return 0;
+
+	avail = Pa_GetStreamReadAvailable(recStream);
+
+	if (avail < 0)
+	{
+		// Stream error - reopen, like the ALSA error recovery
+		ZF_LOGD("capture avail error %s, reopening ..", Pa_GetErrorText((PaError)avail));
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
+		if (recStream == NULL)
+			return 0;
+		avail = Pa_GetStreamReadAvailable(recStream);
+	}
+
+	if (avail < (long)nSamples)
+		return 0;
+
+	if (m_recchannels == 1)
+	{
+		err = Pa_ReadStream(recStream, input, nSamples);
+	}
+	else
+	{
+		err = Pa_ReadStream(recStream, samples, nSamples);
+
+		if (err == paNoError || err == paInputOverflowed)
+		{
+			// Extract the wanted channel from the interleaved stereo data
+
+			if (UseLeftRX)
+				start = 0;
+			else
+				start = 1;
+
+			for (n = 0; n < (int)nSamples; n++)
+				input[n] = samples[n * 2 + start];
+		}
+	}
+
+	// An input overflow means samples were lost before this read;
+	// the data returned is still valid.
+
+	if (err != paNoError && err != paInputOverflowed)
+	{
+		ZF_LOGE("RX Error %s", Pa_GetErrorText(err));
+		Pa_CloseStream(recStream);
+		recStream = NULL;
+		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, NULL);
+		return 0;
+	}
+
+	return nSamples;
 }
 
 
@@ -680,7 +1169,7 @@ short * SendtoCard(short * buf, int n)
 		ProcessNewSamples(buf, 1200);  // signed
 	}
 
-	if (playstreamopen)
+	if (playStream)
 		SoundCardWrite(&buffer[Index][0], n);
 	if (txwff != NULL)
 		WriteWav(&buffer[Index][0], n, txwff);
@@ -695,6 +1184,8 @@ int InitSound(BOOL Quiet)
 {
 	if (strcmp(PlaybackDevice, "NOSOUND") == 0)
 		return (1);
+	if (!EnsurePaInitialized())
+		return 0;
 	GetInputDeviceCollection();
 	GetOutputDeviceCollection();
 	return OpenSoundCard(CaptureDevice, PlaybackDevice, 12000, 12000, NULL);
@@ -790,6 +1281,15 @@ void PollReceivedSamples()
 void StopCapture()
 {
 	Capturing = FALSE;
+
+	if (strcmp(PlaybackDevice, "NOSOUND") == 0)
+		return;
+
+	// StopCapture is only called when we are about to transmit, so use
+	// it to open the playback stream (see SHARECAPTURE in the ALSA
+	// backend).  The capture stream is closed in SoundCardWrite.
+
+	OpenSoundPlayback(SavedPlaybackDevice, SavedPlaybackRate, Savedplaychannels, NULL);
 }
 
 void StartCodec(char * strFault)
@@ -815,6 +1315,12 @@ void StartCapture()
 void CloseSound()
 {
 	CloseSoundCard();
+
+	if (PaInitialized)
+	{
+		Pa_Terminate();
+		PaInitialized = FALSE;
+	}
 }
 
 VOID WriteSamples(short * buffer, int len)
@@ -854,10 +1360,31 @@ void SoundFlush()
 	ZF_LOGD("Tx Time %d Time till end = %d", txlenMs, (pttOnTime + txlenMs) - Now);
 
 	if (strcmp(PlaybackDevice, "NOSOUND") != 0)
+	{
 		while (Now < (pttOnTime + txlenMs))
 		{
 			usleep(2000);
 		}
+
+		// Also wait until PortAudio's ring buffer has fully drained plus
+		// the reported output latency, so PTT is not released while the
+		// tail of the transmission is still sounding.
+
+		if (playStream)
+		{
+			int drainMs = 500;
+			const PaStreamInfo * si = Pa_GetStreamInfo(playStream);
+
+			while (drainMs > 0 && Pa_GetStreamWriteAvailable(playStream) < MaxAvail)
+			{
+				usleep(2000);
+				drainMs -= 2;
+			}
+
+			if (si)
+				usleep((useconds_t)(si->outputLatency * 1e6));
+		}
+	}
 
 	SoundIsPlaying = FALSE;
 
@@ -872,7 +1399,18 @@ void SoundFlush()
 	}
 
 	if (strcmp(PlaybackDevice, "NOSOUND") != 0)
+	{
+		// End of TX: close playback and go back to capture-only
+		// (see SHARECAPTURE in the ALSA backend)
+
+		if (playStream)
+		{
+			Pa_CloseStream(playStream);
+			playStream = NULL;
+		}
+
 		OpenSoundCapture(SavedCaptureDevice, SavedCaptureRate, strFault);
+	}
 	StartCapture();
 
 	if (WriteRxWav)

@@ -143,6 +143,16 @@ else ifeq ($(UNAME_S),Darwin)
 OBJS += $(OBJS_MAC)
 # ld64 has no -Map option; -lrt and -lasound do not exist on Darwin
 LDFLAGS =
+# PORTAUDIO_STATIC can point at a static libportaudio.a (used for the
+# distributable universal build); by default link the Homebrew dylib.
+PORTAUDIO_STATIC ?=
+ifneq ($(PORTAUDIO_STATIC),)
+LDLIBS += $(PORTAUDIO_STATIC) \
+	-framework CoreAudio -framework AudioToolbox -framework AudioUnit \
+	-framework CoreFoundation -framework CoreServices
+else
+LDLIBS += -lportaudio
+endif
 # Homebrew (used for cmocka and portaudio) installs outside the default
 # search paths, e.g. /opt/homebrew on Apple Silicon
 HOMEBREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
