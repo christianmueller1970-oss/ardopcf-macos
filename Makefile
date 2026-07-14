@@ -44,7 +44,6 @@
 # list all object files and their directories
 # keep sorted by filename
 OBJS = \
-	lib/rawhid/rawhid.o \
 	lib/rockliff/rrs.o \
 	lib/ws_server/ws_server.o \
 	src/common/ARDOPC.o \
@@ -73,14 +72,22 @@ OBJS = \
 	src/common/noise.o \
 
 # Linux-only object files
+# rawhid (CM108 PTT) builds only on Linux and Windows, not on macOS
 OBJS_LIN = \
+	lib/rawhid/rawhid.o \
 	src/linux/ALSASound.o \
+	src/linux/LinSerial.o \
+
+# macOS-only object files (serial code is shared with Linux)
+OBJS_MAC = \
+	src/macos/PortAudioSound.o \
 	src/linux/LinSerial.o \
 
 # Windows-only object files
 OBJS_WIN = \
 	src/windows/Waveout.o \
 	lib/hid/hid.o \
+	lib/rawhid/rawhid.o \
 
 # user-facing executables, like ardopcf
 OBJS_EXE = \
@@ -94,6 +101,10 @@ TESTS = \
 	test/ardop/test_log \
 	test/ardop/test_Packed6 \
 	test/ardop/test_StationId \
+
+# test_log mocks fopen & co via the GNU ld --wrap option, which the
+# Apple linker does not support, so that test is skipped on Darwin
+TESTS_NO_WRAP = $(filter-out test/ardop/test_log,$(TESTS))
 
 # unit test common code
 TEST_OBJS_COMMON = \
@@ -123,9 +134,23 @@ TXT2C ?=
 # Leave empty for OS auto-detection
 WIN32 ?= $(filter $(OS),Windows_NT)
 
+UNAME_S := $(shell uname -s)
+
 ifneq ($(WIN32),)
 OBJS += $(OBJS_WIN)
 LDLIBS += -lwsock32 -lwinmm -lsetupapi -lws2_32
+else ifeq ($(UNAME_S),Darwin)
+OBJS += $(OBJS_MAC)
+# ld64 has no -Map option; -lrt and -lasound do not exist on Darwin
+LDFLAGS =
+# Homebrew (used for cmocka and portaudio) installs outside the default
+# search paths, e.g. /opt/homebrew on Apple Silicon
+HOMEBREW_PREFIX ?= $(shell brew --prefix 2>/dev/null)
+ifneq ($(HOMEBREW_PREFIX),)
+CPPFLAGS += -I$(HOMEBREW_PREFIX)/include
+LDFLAGS += -L$(HOMEBREW_PREFIX)/lib
+endif
+TESTS := $(TESTS_NO_WRAP)
 else
 OBJS += $(OBJS_LIN)
 LDLIBS += -lrt -lasound

@@ -554,7 +554,10 @@ static void buffer_callback(zf_log_message *msg, char *buf);
 STATIC_ASSERT(eol_fits_eol_sz, sizeof(ZF_LOG_EOL) <= ZF_LOG_EOL_SZ);
 STATIC_ASSERT(eol_sz_greater_than_zero, 0 < ZF_LOG_EOL_SZ);
 STATIC_ASSERT(eol_sz_less_than_buf_sz, ZF_LOG_EOL_SZ < ZF_LOG_BUF_SZ);
-#if !defined(_WIN32) && !defined(_WIN64)
+/* On macOS PIPE_BUF is only 512, which would force a log buffer too small
+ * for ardop's messages.  Like on Windows, forgo the pipe write atomicity
+ * guarantee there (log output is written by a single process anyway). */
+#if !defined(_WIN32) && !defined(_WIN64) && !defined(__APPLE__)
 	STATIC_ASSERT(buf_sz_less_than_pipe_buf, ZF_LOG_BUF_SZ <= PIPE_BUF);
 #endif
 static const char c_hex[] = "0123456789abcdef";
